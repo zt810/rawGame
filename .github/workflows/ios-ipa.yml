@@ -1,0 +1,144 @@
+name: Xuất file IPA cho iPhone
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  xcode:
+    name: Unity xuất project Xcode
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Dọn bớt ổ đĩa máy build
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          large-packages: false
+          swap-storage: false
+
+      - name: Lấy mã nguồn
+        uses: actions/checkout@v7
+
+      - name: Dùng lại thư mục Library của lần build trước
+        uses: actions/cache@v6
+        with:
+          path: Library
+          key: Library-iOS-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
+          restore-keys: |
+            Library-iOS-
+
+      - name: Nhúng khóa bí mật vào mã ký dữ liệu
+        env:
+          MICAY_KEY: ${{ secrets.MICAY_KEY }}
+        run: python3 Tools/bake_key.py
+
+      - name: Unity build iOS
+        uses: game-ci/unity-builder@v5
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          targetPlatform: iOS
+          buildName: MiCay
+          buildMethod: MiCay.EditorTools.IosBuild.Build
+          versioning: None
+          customParameters: -iosBuildNumber ${{ github.run_number }}
+
+      - name: Nén project Xcode
+        run: |
+          if [ ! -d build/iOS/MiCay/Unity-iPhone.xcodeproj ]; then
+            echo "::error::Unity không xuất ra được project Xcode. Xem log của bước Unity build iOS."
+            exit 1
+          fi
+          sudo tar -cf - -C build/iOS MiCay | xz -T0 -6 > xcode-project.tar.xz
+          ls -lh xcode-project.tar.xz
+
+      - name: Gửi project Xcode sang máy macOS
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: xcode-project
+          path: xcode-project.tar.xz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  ipa:
+    name: Xcode biên dịch file IPA
+    needs: xcode
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      IPA_NAME: TiemMyCay-${{ github.run_number }}.ipa
+    steps:
+      - name: Nhận project Xcode
+        uses: actions/download-artifact@v8
+        with:
+          name: xcode-project
+
+      - name: Giải nén project Xcode
+        run: tar -xf xcode-project.tar.xz
+
+      - name: Biên dịch bằng Xcode, không ký
+        working-directory: MiCay
+        run: |
+          archive() {
+            xcodebuild -quiet \
+              -project Unity-iPhone.xcodeproj \
+              -scheme Unity-iPhone \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination generic/platform=iOS \
+              -archivePath "$RUNNER_TEMP/MiCay.xcarchive" \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+              archive 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+          }
+          if ! archive; then
+            grep -q "is not installed" "$RUNNER_TEMP/xcodebuild.log" || exit 1
+            xcodebuild -downloadPlatform iOS
+            archive
+          fi
+
+      - name: Đóng gói file IPA
+        run: |
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$RUNNER_TEMP/MiCay.xcarchive/Products/Applications/"*.app "$RUNNER_TEMP/ipa/Payload/"
+          (cd "$RUNNER_TEMP/ipa" && zip -qry "$GITHUB_WORKSPACE/$IPA_NAME" Payload)
+          ls -lh "$IPA_NAME"
+
+      - name: Tải file IPA lên
+        id: ipa
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ env.IPA_NAME }}
+          archive: false
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Tải file IPA lên dạng zip
+        if: steps.ipa.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: TiemMyCay-${{ github.run_number }}
+          path: ${{ env.IPA_NAME }}
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Xóa project Xcode tạm
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/${{ needs.xcode.outputs.artifact-id }}" --silent
